@@ -3,7 +3,7 @@ project:
   title:        "SkyKey"      # Project title
   author:       "Sehrey Kita"      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Bit-serial SHA-1 hash engine for HMAC and one-time login codes, seeded by a sky camera"      # One line description of what your project does
+  description:  "Bit-serial SHA-1 round engine for HMAC and one-time login codes (TOTP), driven over serial"      # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     10000000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -25,7 +25,7 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "RX (serial in, 38400 baud)"
+  ui[0]: "RX (serial in, 115200 baud)"
   ui[1]: ""
   ui[2]: ""
   ui[3]: ""
@@ -45,7 +45,7 @@ pinout:
   uo[7]: "BUSY (hashing)"
 
   # Bidirectional pins
-  uio[0]: "TX (serial out, 38400 baud)"
+  uio[0]: "TX (serial out, 115200 baud)"
   uio[1]: ""
   uio[2]: ""
   uio[3]: ""
