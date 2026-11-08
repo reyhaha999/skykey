@@ -8,7 +8,9 @@
  * Serial commands (38,400 baud, 8N1, 10 MHz clock):
  *   '?'            reply 'K'
  *   'S' + 20 bytes load the hash state H0..H4 (big endian)
+ *   'I'            reset the hash state to the SHA-1 starting value, reply 'K'
  *   'B' + 64 bytes load a block, run SHA-1 on it, reply with the new 20-byte state
+ *   'b' + 64 bytes same, but reply just 'K' (for blocks whose result is not needed)
  *   'Q'            reply with the current 20-byte state
  *   'T'            self-test (hashes "abc", checks the known answer), reply 'P' or 'F'
  */
@@ -90,10 +92,12 @@ module tt_um_reyhaha999_skykey (
   wire [4:0] exp_bits = {EXPECT[128+cj], EXPECT[96+cj], EXPECT[64+cj], EXPECT[32+cj], EXPECT[cj]};
 
   // ----------------------------------------------------------------- control
-  localparam [2:0] C_IDLE = 3'd0, C_SRX = 3'd1, C_BRX = 3'd2, C_RUN = 3'd3, C_TXD = 3'd4,
-                   C_BLD = 3'd5, C_BRUN = 3'd6, C_BCMP = 3'd7;
+  localparam [3:0] C_IDLE = 4'd0, C_SRX = 4'd1, C_BRX = 4'd2, C_RUN = 4'd3, C_TXD = 4'd4,
+                   C_BLD = 4'd5, C_BRUN = 4'd6, C_BCMP = 4'd7, C_IV = 4'd8;
 
-  reg [2:0] cs;
+  reg [3:0] cs;
+  reg       quiet;  // 'b' command: acknowledge with 'K' instead of the digest
+  reg       ivm;  // loading the SHA-1 starting value
   reg [6:0] n;  // byte counter
   reg       pending;  // a received byte is waiting for its slot
   reg       ins;  // inserting the pending byte (8 clocks)
@@ -114,8 +118,9 @@ module tt_um_reyhaha999_skykey (
 
   assign w_force = ((cs == C_BRX) & ins_act) | bld;
   assign w_bit = bld ? bist_w : ins_bit;
-  assign h_force = bld ? {5{cnt[8:5] == 4'd0}} : {5{(cs == C_SRX) & ins_act}} & (5'b00001 << n[4:2]);
-  assign h_bits = bld ? iv_bits : {5{ins_bit}};
+  assign h_force = ({5{bld & (cnt[8:5] == 4'd0)}}) | {5{ivm}} |
+                   ({5{(cs == C_SRX) & ins_act}} & (5'b00001 << n[4:2]));
+  assign h_bits = (bld | ivm) ? iv_bits : {5{ins_bit}};
 
   wire cap_start = (cs == C_TXD) & ~capping & ~send_pending & ~tx_busy &
                    (cnt[4:3] == ~n[1:0]) & (bi == 3'd0);
@@ -132,6 +137,8 @@ module tt_um_reyhaha999_skykey (
       ins          <= 1'b0;
       capping      <= 1'b0;
       bld          <= 1'b0;
+      quiet        <= 1'b0;
+      ivm          <= 1'b0;
       mism         <= 1'b0;
       res          <= 2'd0;
       start        <= 1'b0;
@@ -162,7 +169,15 @@ module tt_um_reyhaha999_skykey (
                 send_pending <= 1'b1;
               end
               "S": cs <= C_SRX;
-              "B": cs <= C_BRX;
+              "B": begin
+                cs    <= C_BRX;
+                quiet <= 1'b0;
+              end
+              "b": begin
+                cs    <= C_BRX;
+                quiet <= 1'b1;
+              end
+              "I": cs <= C_IV;
               "Q": cs <= C_TXD;
               "T": begin
                 cs  <= C_BLD;
@@ -195,8 +210,26 @@ module tt_um_reyhaha999_skykey (
         end
         C_RUN: begin
           if (core_done) begin
-            cs <= C_TXD;
-            n  <= 7'd0;
+            n <= 7'd0;
+            if (quiet) begin
+              cs           <= C_IDLE;
+              cap          <= 8'h4B;
+              send_pending <= 1'b1;
+            end else begin
+              cs <= C_TXD;
+            end
+          end
+        end
+        C_IV: begin  // one 32-clock word-time drops the starting value into H0..H4
+          if (cnt[4:0] == 5'd31) begin
+            if (ivm) begin
+              ivm          <= 1'b0;
+              cs           <= C_IDLE;
+              cap          <= 8'h4B;
+              send_pending <= 1'b1;
+            end else begin
+              ivm <= 1'b1;
+            end
           end
         end
         C_TXD: begin
