@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "host"))
 import skykey  # noqa: E402
 
 GATES = os.environ.get("GATES", "no") == "yes"
-BIT_NS = 26000  # one serial bit at 38,400 baud
+BIT_NS = 8700  # one serial bit at 115,200 baud (87 clocks of 100 ns)
 TIMEOUT_BITS = 12000
 
 
@@ -65,20 +65,10 @@ class SimChip:
     async def ping(self):
         return await self.ask(b"?", 1)
 
-    async def reset_state(self):
-        assert await self.ask(b"I", 1) == b"K"
-
-    async def compress(self, block: bytes, want_digest: bool = True):
-        if want_digest:
-            return await self.ask(b"B" + block, 20)
-        assert await self.ask(b"b" + block, 1) == b"K"
-        return None
-
-    async def read_state(self) -> bytes:
-        return await self.ask(b"Q", 20)
-
-    async def set_state(self, state: bytes):
-        assert await self.ask(b"S" + state, 1) == b"K"
+    async def compress(self, state, block: bytes):
+        """Run one block through the chip; returns the new hash state."""
+        reply = await self.ask(b"B" + skykey.chip_request(state, block), 20)
+        return skykey.chip_result(state, reply)
 
 
 async def start_chip(dut) -> SimChip:
@@ -105,17 +95,6 @@ async def test_ping_and_selftest(dut):
     assert seg_text(dut) == "-"
     assert await chip.ask(b"T", 1) == b"P", "built-in self-test failed"
     assert seg_text(dut) == "P"
-
-
-@cocotb.test()
-async def test_state_read_write(dut):
-    """The hash state can be written and read back."""
-    chip = await start_chip(dut)
-    state = bytes(range(0x10, 0x24))
-    await chip.set_state(state)
-    assert await chip.read_state() == state
-    await chip.reset_state()
-    assert await chip.read_state() == skykey.IV
 
 
 @cocotb.test()
@@ -184,40 +163,28 @@ async def test_totp_rfc6238(dut):
 
 
 @cocotb.test()
-async def test_back_to_back_and_chaining(dut):
-    """Chained blocks without resetting the state match one long hash; 'Q' does not disturb it."""
+async def test_random_blocks(dut):
+    """Random blocks and random starting states match a software SHA-1 round model."""
     chip = await start_chip(dut)
-    data = os.urandom(64 * 3)
-    await chip.reset_state()
-    state = None
-    for i in range(3):
-        state = await chip.compress(data[i * 64 : (i + 1) * 64], want_digest=(i == 2))
-    # compare with a software SHA-1 core
-    ref = sw_compress_chain(data)
-    assert state == ref
+    for _ in range(2 if GATES else 4):
+        state = tuple(int.from_bytes(os.urandom(4), "big") for _ in range(5))
+        block = os.urandom(64)
+        got = await chip.compress(state, block)
+        assert got == sw_compress(state, block), "chip and software model disagree"
 
 
-def rol(x, n):
-    return ((x << n) | (x >> (32 - n))) & 0xFFFFFFFF
-
-
-def sw_compress_chain(data: bytes) -> bytes:
-    """Plain software SHA-1 compression without padding (reference for chaining)."""
-    h = [int.from_bytes(skykey.IV[i * 4 : i * 4 + 4], "big") for i in range(5)]
-    for off in range(0, len(data), 64):
-        w = [int.from_bytes(data[off + 4 * i : off + 4 * i + 4], "big") for i in range(16)]
-        for t in range(16, 80):
-            w.append(rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1))
-        a, b, c, d, e = h
-        for t in range(80):
-            if t < 20:
-                f, k = (b & c) | (~b & d), 0x5A827999
-            elif t < 40:
-                f, k = b ^ c ^ d, 0x6ED9EBA1
-            elif t < 60:
-                f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
-            else:
-                f, k = b ^ c ^ d, 0xCA62C1D6
-            a, b, c, d, e = (rol(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF, a, rol(b, 30), c, d
-        h = [(x + y) & 0xFFFFFFFF for x, y in zip(h, (a, b, c, d, e))]
-    return b"".join(x.to_bytes(4, "big") for x in h)
+def sw_compress(state, block):
+    """Plain software SHA-1 compression function (reference)."""
+    w = skykey.expand(block)
+    a, b, c, d, e = state
+    for t in range(80):
+        if t < 20:
+            f, k = (b & c) | (~b & d), 0x5A827999
+        elif t < 40:
+            f, k = b ^ c ^ d, 0x6ED9EBA1
+        elif t < 60:
+            f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+        else:
+            f, k = b ^ c ^ d, 0xCA62C1D6
+        a, b, c, d, e = (skykey.rol(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF, a, skykey.rol(b, 30), c, d
+    return tuple((x + y) & 0xFFFFFFFF for x, y in zip(state, (a, b, c, d, e)))

@@ -2,17 +2,19 @@
  * Copyright (c) 2026 Sehrey Kita
  * SPDX-License-Identifier: Apache-2.0
  *
- * SkyKey: a tiny SHA-1 hash engine on a chip, driven over a serial link.
- * A computer builds HMAC and one-time login codes (TOTP) out of it.
+ * SkyKey: a tiny SHA-1 round engine on a chip, driven over a serial link.
+ * A computer builds SHA-1, HMAC and one-time login codes (TOTP) out of it.
  *
- * Serial commands (38,400 baud, 8N1, 10 MHz clock):
- *   '?'            reply 'K'
- *   'S' + 20 bytes load the hash state H0..H4 (big endian)
- *   'I'            reset the hash state to the SHA-1 starting value, reply 'K'
- *   'B' + 64 bytes load a block, run SHA-1 on it, reply with the new 20-byte state
- *   'b' + 64 bytes same, but reply just 'K' (for blocks whose result is not needed)
- *   'Q'            reply with the current 20-byte state
- *   'T'            self-test (hashes "abc", checks the known answer), reply 'P' or 'F'
+ * Serial link: 115,200 baud, 8N1, 10 MHz clock.
+ *
+ *   '?'   chip replies 'K'
+ *   'T'   self-test: the chip runs a known block through itself and checks the
+ *         known answer.  Replies 'P' (pass) or 'F' (fail).
+ *   'B'   run one block.  The computer then sends
+ *            20 bytes   starting values  a0, a-1, a-2, a-3, a-4  (big endian words)
+ *           320 bytes   the 80 message words W0..W79            (big endian words)
+ *         and the chip replies with 20 bytes: the five values a80..a76.
+ *         (host/skykey.py does the message expansion and the final addition.)
  */
 
 `default_nettype none
@@ -56,212 +58,188 @@ module tt_um_reyhaha999_skykey (
   );
 
   // -------------------------------------------------------------------- core
-  wire [8:0] cnt;
-  wire [4:0] h_out;
-  wire       core_busy, core_done;
-  reg        start;
-  wire       w_force, w_bit;
-  wire [4:0] h_force, h_bits;
+  wire [4:0] j;
+  wire [2:0] q;
+  wire       vout, wvalid, core_done, core_busy;
+  wire [6:0] rnd;
+  reg        arm, w_set, bist;
+  wire       v_force, v_bit, w_force, w_bit;
 
   sha1_core u_core (
       .clk(clk),
       .rst(rst),
-      .start(start),
+      .arm(arm),
+      .wz(bist),
+      .v_force(v_force),
+      .v_bit(v_bit),
       .w_force(w_force),
       .w_bit(w_bit),
-      .h_force(h_force),
-      .h_bits(h_bits),
-      .cnt(cnt),
-      .h_out(h_out),
-      .busy(core_busy),
-      .done(core_done)
+      .w_set(w_set),
+      .j(j),
+      .q(q),
+      .vout(vout),
+      .wvalid(wvalid),
+      .rnd(rnd),
+      .done(core_done),
+      .busy(core_busy)
   );
 
   // ----------------------------------------------------------- self-test data
-  localparam [31:0] W0 = 32'h61626380;  // "abc" + 0x80 padding bit
-  localparam [31:0] W15 = 32'h00000018;  // message length: 24 bits
-  localparam [159:0] IV = {32'hC3D2E1F0, 32'h10325476, 32'h98BADCFE, 32'hEFCDAB89, 32'h67452301};
-  localparam [159:0] EXPECT = {
-    32'h9CD0D89D, 32'h7850C26C, 32'hBA3E2571, 32'h4706816A, 32'hA9993E36
-  };
+  // Starting values for the standard SHA-1 initial state, and the five values
+  // the rounds must produce when every message word is zero.  Both were
+  // computed with the software model in host/skykey.py.
+  localparam [159:0] PRE = 160'h67452301efcdab8962eb73fa40c951d80f4b87c3;
+  localparam [159:0] EXP = 160'h2b6ee1e4668ae1644d7fc143bb4babca1891628d;
 
-  wire [3:0] cw = cnt[8:5];
-  wire [4:0] cj = cnt[4:0];
-  wire       bist_w = (cw == 4'd0) ? W0[cj] : (cw == 4'd15) ? W15[cj] : 1'b0;
-  wire [4:0] iv_bits = {IV[128+cj], IV[96+cj], IV[64+cj], IV[32+cj], IV[cj]};
-  wire [4:0] exp_bits = {EXPECT[128+cj], EXPECT[96+cj], EXPECT[64+cj], EXPECT[32+cj], EXPECT[cj]};
+  reg [4:0] n;  // byte counter
+  wire [7:0] pre_byte = PRE[(5'd19 - n) * 8+:8];
+  wire [7:0] exp_byte = EXP[(5'd19 - n) * 8+:8];
 
   // ----------------------------------------------------------------- control
-  localparam [3:0] C_IDLE = 4'd0, C_SRX = 4'd1, C_BRX = 4'd2, C_RUN = 4'd3, C_TXD = 4'd4,
-                   C_BLD = 4'd5, C_BRUN = 4'd6, C_BCMP = 4'd7, C_IV = 4'd8;
+  localparam [2:0] C_IDLE = 3'd0, C_LD = 3'd1, C_WR = 3'd2, C_TXD = 3'd3;
 
-  reg [3:0] cs;
-  reg       quiet;  // 'b' command: acknowledge with 'K' instead of the digest
-  reg       ivm;  // loading the SHA-1 starting value
-  reg [6:0] n;  // byte counter
+  reg [2:0] cs;
   reg       pending;  // a received byte is waiting for its slot
-  reg       ins;  // inserting the pending byte (8 clocks)
-  reg       capping;  // capturing a digest byte (8 clocks)
-  reg       bld;  // self-test load revolution
+  reg       ins;  // inserting a byte (8 clocks)
+  reg       capping;  // capturing a result byte (8 clocks)
   reg       mism;
   reg [1:0] res;  // 0 none, 1 pass, 2 fail
 
-  wire [2:0] bi = cnt[2:0];
-  wire       in_rx = (cs == C_SRX) | (cs == C_BRX);
-  wire       slot_w = (cnt[8:3] == (n[5:0] ^ 6'd3));
-  wire       slot_h = (cnt[4:3] == ~n[1:0]);
-  wire       slot_ok = (cs == C_BRX) ? slot_w : slot_h;
-  wire       ins_start = in_rx & pending & ~ins & slot_ok & (bi == 3'd0);
-  wire       ins_act = in_rx & (ins | ins_start);
-  wire       ins_bit = rx_data[bi];
-  wire       ins_last = ins_act & (bi == 3'd7);
+  wire [2:0] bi = j[2:0];
 
-  assign w_force = ((cs == C_BRX) & ins_act) | bld;
-  assign w_bit = bld ? bist_w : ins_bit;
-  assign h_force = ({5{bld & (cnt[8:5] == 4'd0)}}) | {5{ivm}} |
-                   ({5{(cs == C_SRX) & ins_act}} & (5'b00001 << n[4:2]));
-  assign h_bits = (bld | ivm) ? iv_bits : {5{ins_bit}};
+  // where do the bytes of the five starting values go?  word m (0..4) sits in
+  // turn-slot q = 5 - m, and the byte inside the word picks j[4:3] = 3 - b
+  wire [2:0] mword = n[4:2];
+  wire [2:0] q_ins = 3'd5 - mword;
+  // where do the five result words appear?  a80 in q=1, a79 in q=0, then 5,4,3
+  reg [2:0] q_rd;
+  always @* begin
+    case (n[4:2])
+      3'd0: q_rd = 3'd1;
+      3'd1: q_rd = 3'd0;
+      3'd2: q_rd = 3'd5;
+      3'd3: q_rd = 3'd4;
+      default: q_rd = 3'd3;
+    endcase
+  end
 
-  wire cap_start = (cs == C_TXD) & ~capping & ~send_pending & ~tx_busy &
-                   (cnt[4:3] == ~n[1:0]) & (bi == 3'd0);
+  wire have = (cs == C_LD) ? (bist | pending) : (pending & ~wvalid);
+  wire slot_ld = (q == q_ins) & (j[4:3] == ~n[1:0]);
+  wire slot_wr = (j[4:3] == ~n[1:0]);
+  wire slot_ok = (cs == C_LD) ? slot_ld : slot_wr;
+  wire in_rx = (cs == C_LD) | (cs == C_WR);
+  wire ins_start = in_rx & have & ~ins & slot_ok & (bi == 3'd0);
+  wire ins_act = in_rx & (ins | ins_start);
+  wire [7:0] ins_byte = (cs == C_LD & bist) ? pre_byte : cap;  // cap holds the received byte
+  wire ins_bit = ins_byte[bi];
+  wire ins_last = ins_act & (bi == 3'd7);
+
+  assign v_force = (cs == C_LD) & ins_act;
+  assign v_bit = ins_bit;
+  assign w_force = (cs == C_WR) & ins_act;
+  assign w_bit = ins_bit;
+
+  wire cap_start = (cs == C_TXD) & ~capping & ~send_pending & (bist | ~tx_busy) &
+                   (q == q_rd) & (j[4:3] == ~n[1:0]) & (bi == 3'd0);
   wire cap_act = capping | cap_start;
-  wire sel = h_out[n[4:2]];
-
-  wire mm = |(h_out ^ exp_bits);
+  wire [7:0] cap_next = {vout, cap[7:1]};
+  wire cap_last = cap_act & (bi == 3'd7);
+  wire byte_bad = (cap_next != exp_byte);
 
   always @(posedge clk) begin
     if (rst) begin
       cs           <= C_IDLE;
-      n            <= 7'd0;
+      n            <= 5'd0;
       pending      <= 1'b0;
       ins          <= 1'b0;
       capping      <= 1'b0;
-      bld          <= 1'b0;
-      quiet        <= 1'b0;
-      ivm          <= 1'b0;
       mism         <= 1'b0;
       res          <= 2'd0;
-      start        <= 1'b0;
+      arm          <= 1'b0;
+      w_set        <= 1'b0;
+      bist         <= 1'b0;
       send_pending <= 1'b0;
       cap          <= 8'd0;
     end else begin
-      start <= 1'b0;
+      arm   <= 1'b0;
+      w_set <= 1'b0;
       if (tx_go) send_pending <= 1'b0;
-      if (rx_valid) pending <= 1'b1;
+      if (rx_valid) begin
+        pending <= 1'b1;
+        // keep the byte: the serial port starts overwriting it when the next one arrives
+        if (in_rx) cap <= rx_data;
+      end
 
       if (ins_start) ins <= 1'b1;
       if (ins_last) ins <= 1'b0;
       if (cap_start) capping <= 1'b1;
-      if (cap_act) cap <= {sel, cap[7:1]};
-      if (cap_act & (bi == 3'd7)) begin
-        capping      <= 1'b0;
-        send_pending <= 1'b1;
-      end
+      if (cap_act) cap <= cap_next;
+      if (cap_last) capping <= 1'b0;
 
       case (cs)
         C_IDLE: begin
           if (pending & ~rx_valid) begin
             pending <= 1'b0;
-            n       <= 7'd0;
+            n       <= 5'd0;
             case (rx_data)
               "?": begin
                 cap          <= 8'h4B;
                 send_pending <= 1'b1;
               end
-              "S": cs <= C_SRX;
               "B": begin
-                cs    <= C_BRX;
-                quiet <= 1'b0;
+                cs   <= C_LD;
+                bist <= 1'b0;
               end
-              "b": begin
-                cs    <= C_BRX;
-                quiet <= 1'b1;
-              end
-              "I": cs <= C_IV;
-              "Q": cs <= C_TXD;
               "T": begin
-                cs  <= C_BLD;
-                bld <= 1'b0;
+                cs   <= C_LD;
+                bist <= 1'b1;
+                mism <= 1'b0;
               end
               default: ;
             endcase
           end
         end
-        C_SRX: begin
+        C_LD: begin  // five starting values into the working ring
+          if (ins_last) begin
+            if (!bist) pending <= 1'b0;
+            n <= n + 5'd1;
+            if (n == 5'd19) begin
+              arm <= 1'b1;
+              n   <= 5'd0;
+              cs  <= C_WR;
+            end
+          end
+        end
+        C_WR: begin  // 80 message words (computer sends them, or self-test uses zeros)
           if (ins_last) begin
             pending <= 1'b0;
-            n       <= n + 7'd1;
-            if (n == 7'd19) begin
-              cs           <= C_IDLE;
-              cap          <= 8'h4B;
-              send_pending <= 1'b1;
-            end
+            n       <= n + 5'd1;
+            if (n[1:0] == 2'd3) w_set <= 1'b1;
           end
-        end
-        C_BRX: begin
-          if (ins_last) begin
-            pending <= 1'b0;
-            n       <= n + 7'd1;
-            if (n == 7'd63) begin
-              cs    <= C_RUN;
-              start <= 1'b1;
-            end
-          end
-        end
-        C_RUN: begin
           if (core_done) begin
-            n <= 7'd0;
-            if (quiet) begin
-              cs           <= C_IDLE;
-              cap          <= 8'h4B;
+            cs <= C_TXD;
+            n  <= 5'd0;
+          end
+        end
+        C_TXD: begin  // read the five result words back out of the ring
+          if (cap_last) begin
+            if (bist) begin
+              mism <= mism | byte_bad;
+              n    <= n + 5'd1;
+              if (n == 5'd19) begin
+                cs           <= C_IDLE;
+                bist         <= 1'b0;
+                res          <= (mism | byte_bad) ? 2'd2 : 2'd1;
+                cap          <= (mism | byte_bad) ? 8'h46 : 8'h50;
+                send_pending <= 1'b1;
+              end
+            end else begin
               send_pending <= 1'b1;
-            end else begin
-              cs <= C_TXD;
             end
           end
-        end
-        C_IV: begin  // one 32-clock word-time drops the starting value into H0..H4
-          if (cnt[4:0] == 5'd31) begin
-            if (ivm) begin
-              ivm          <= 1'b0;
-              cs           <= C_IDLE;
-              cap          <= 8'h4B;
-              send_pending <= 1'b1;
-            end else begin
-              ivm <= 1'b1;
-            end
-          end
-        end
-        C_TXD: begin
-          if (tx_go) begin
-            n <= n + 7'd1;
-            if (n == 7'd19) cs <= C_IDLE;
-          end
-        end
-        C_BLD: begin  // one full revolution drops "abc" into the message ring
-          if (cnt == 9'd511) begin
-            if (bld) begin
-              bld   <= 1'b0;
-              start <= 1'b1;
-              cs    <= C_BRUN;
-            end else begin
-              bld <= 1'b1;
-            end
-          end
-        end
-        C_BRUN: begin
-          if (core_done) begin
-            cs   <= C_BCMP;
-            mism <= 1'b0;
-          end
-        end
-        C_BCMP: begin  // compare all five state words with the known answer
-          mism <= mism | mm;
-          if (cnt[4:0] == 5'd31) begin
-            cs           <= C_IDLE;
-            res          <= (mism | mm) ? 2'd2 : 2'd1;
-            cap          <= (mism | mm) ? 8'h46 : 8'h50;
-            send_pending <= 1'b1;
+          if (!bist && tx_go) begin
+            n <= n + 5'd1;
+            if (n == 5'd19) cs <= C_IDLE;
           end
         end
         default: cs <= C_IDLE;
@@ -270,7 +248,7 @@ module tt_um_reyhaha999_skykey (
   end
 
   // ------------------------------------------------------------- 7-seg + pins
-  wire busy_any = (cs != C_IDLE) | core_busy;
+  wire busy_any = (cs != C_IDLE);
   reg [6:0] seg;
   always @* begin
     if (busy_any) seg = 7'b1110110;  // H (hashing)
@@ -283,6 +261,6 @@ module tt_um_reyhaha999_skykey (
   assign uio_out = {7'b0, tx_line};
   assign uio_oe  = 8'b00000001;
 
-  wire _unused = &{ena, ui_in[7:1], uio_in, 1'b0};
+  wire _unused = &{ena, ui_in[7:1], uio_in, core_busy, rnd, 1'b0};
 
 endmodule

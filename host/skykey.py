@@ -24,7 +24,8 @@ import time
 import urllib.parse
 import urllib.request
 
-IV = bytes.fromhex("67452301EFCDAB8998BADCFE10325476C3D2E1F0")
+IV = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
+M32 = 0xFFFFFFFF
 
 SKY_URLS = [
     "https://sgo.fi/Data/RealTime/Kuvat/SOD.jpg",
@@ -32,10 +33,66 @@ SKY_URLS = [
 ]
 
 
+def rol(x: int, n: int) -> int:
+    return ((x << n) | (x >> (32 - n))) & M32
+
+
 # ---------------------------------------------------------------------------
-# Hash recipes.  Each one is a generator: it yields (block, first) requests and
-# is sent back the chip's answer.  That lets the very same recipe run against a
-# real serial port (drive) or against a simulated chip (adrive in the tests).
+# What the computer does around the chip.
+#
+# The chip runs the 80 SHA-1 rounds.  The computer
+#   1. expands the 64-byte block into 80 message words (a few XORs),
+#   2. turns the hash state into the five starting values the rounds need,
+#   3. adds the chip's answer back into the hash state.
+# ---------------------------------------------------------------------------
+
+
+def expand(block: bytes):
+    w = [int.from_bytes(block[4 * i : 4 * i + 4], "big") for i in range(16)]
+    for t in range(16, 80):
+        w.append(rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1))
+    return w
+
+
+def start_values(state):
+    h = state
+    return [h[0], h[1], rol(h[2], 2), rol(h[3], 2), rol(h[4], 2)]
+
+
+def finish(state, raw):
+    h = state
+    return tuple(
+        (x + y) & M32
+        for x, y in zip(h, [raw[0], raw[1], rol(raw[2], 30), rol(raw[3], 30), rol(raw[4], 30)])
+    )
+
+
+def words_to_bytes(words) -> bytes:
+    return b"".join(x.to_bytes(4, "big") for x in words)
+
+
+def bytes_to_words(data: bytes):
+    return [int.from_bytes(data[i : i + 4], "big") for i in range(0, len(data), 4)]
+
+
+def chip_request(state, block: bytes) -> bytes:
+    """The 340 bytes that follow the 'B' command."""
+    return words_to_bytes(start_values(state)) + words_to_bytes(expand(block))
+
+
+def chip_result(state, reply: bytes):
+    """Turn the chip's 20-byte reply into the new hash state."""
+    return finish(state, bytes_to_words(reply))
+
+
+def state_bytes(state) -> bytes:
+    return words_to_bytes(state)
+
+
+# ---------------------------------------------------------------------------
+# Hash recipes.  Each one is a generator that yields (state, block) and is sent
+# back the new state.  That lets the very same recipe run against a real serial
+# port (drive) or against a simulated chip (adrive in the tests).
 # ---------------------------------------------------------------------------
 
 
@@ -49,14 +106,10 @@ def pad_blocks(data: bytes, prefix_len: int = 0):
 
 
 def sha1_gen(data: bytes, prefix_len: int = 0):
-    """Hash `data`.  Yields ("reset",), ("block", b, want_digest)."""
-    yield ("reset",)
-    blocks = pad_blocks(data, prefix_len)
-    digest = None
-    for i, blk in enumerate(blocks):
-        last = i == len(blocks) - 1
-        digest = yield ("block", blk, last)
-    return digest
+    state = IV
+    for blk in pad_blocks(data, prefix_len):
+        state = yield (state, blk)
+    return state_bytes(state)
 
 
 def hmac_gen(key: bytes, msg: bytes):
@@ -66,20 +119,15 @@ def hmac_gen(key: bytes, msg: bytes):
     ipad = bytes(x ^ 0x36 for x in key)
     opad = bytes(x ^ 0x5C for x in key)
 
-    yield ("reset",)
-    yield ("block", ipad, False)
-    blocks = pad_blocks(msg, 64)
-    inner = None
-    for i, blk in enumerate(blocks):
-        inner = yield ("block", blk, i == len(blocks) - 1)
+    state = yield (IV, ipad)
+    for blk in pad_blocks(msg, 64):
+        state = yield (state, blk)
+    inner = state_bytes(state)
 
-    yield ("reset",)
-    yield ("block", opad, False)
-    blocks = pad_blocks(inner, 64)
-    outer = None
-    for i, blk in enumerate(blocks):
-        outer = yield ("block", blk, i == len(blocks) - 1)
-    return outer
+    state = yield (IV, opad)
+    for blk in pad_blocks(inner, 64):
+        state = yield (state, blk)
+    return state_bytes(state)
 
 
 def truncate(mac: bytes, digits: int = 6) -> str:
@@ -100,12 +148,7 @@ def drive(gen, chip):
     try:
         req = next(gen)
         while True:
-            if req[0] == "reset":
-                chip.reset_state()
-                answer = None
-            else:
-                answer = chip.compress(req[1], req[2])
-            req = gen.send(answer)
+            req = gen.send(chip.compress(*req))
     except StopIteration as stop:
         return stop.value
 
@@ -115,12 +158,7 @@ async def adrive(gen, chip):
     try:
         req = next(gen)
         while True:
-            if req[0] == "reset":
-                await chip.reset_state()
-                answer = None
-            else:
-                answer = await chip.compress(req[1], req[2])
-            req = gen.send(answer)
+            req = gen.send(await chip.compress(*req))
     except StopIteration as stop:
         return stop.value
 
@@ -131,10 +169,10 @@ async def adrive(gen, chip):
 
 
 class SkyKeyChip:
-    def __init__(self, port: str, baud: int = 38400):
+    def __init__(self, port: str, baud: int = 115200):
         import serial  # pip install pyserial
 
-        self.ser = serial.Serial(port, baud, timeout=2)
+        self.ser = serial.Serial(port, baud, timeout=5)
         self.ser.reset_input_buffer()
         if not self.ping():
             raise RuntimeError("the chip did not answer; check the wiring and the 10 MHz clock")
@@ -153,17 +191,11 @@ class SkyKeyChip:
         self.ser.write(b"T")
         return self._expect(1) == b"P"
 
-    def reset_state(self):
-        self.ser.write(b"I")
-        assert self._expect(1) == b"K"
-
-    def compress(self, block: bytes, want_digest: bool = True):
+    def compress(self, state, block: bytes):
+        """Run one 64-byte block through the chip; returns the new hash state."""
         assert len(block) == 64
-        self.ser.write((b"B" if want_digest else b"b") + block)
-        if want_digest:
-            return self._expect(20)
-        assert self._expect(1) == b"K"
-        return None
+        self.ser.write(b"B" + chip_request(state, block))
+        return chip_result(state, self._expect(20))
 
     def sha1(self, data: bytes) -> bytes:
         return drive(sha1_gen(data), self)
