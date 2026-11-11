@@ -9,9 +9,12 @@ you have.
 
 Enrollment (once): the chip hashes your sky photo (mixed with your computer's
 own randomness) into a secret.  The secret is shown once, as a QR link for
-your authenticator app, and loaded into the chip in HMAC's pre-mixed form.
-After that the program forgets it.  Each login code is made on the chip: this
-program only sends the time counter, which is public.
+your authenticator app.  HMAC turns it into two hash states; the inner one is
+loaded into the chip and the outer one is saved on this computer, then the
+secret itself is forgotten.  Every login code starts with a hash only the chip
+can make, so no code can be made without the chip; the saved outer state is
+useless on its own.  This program only ever sends the chip public data (the
+time counter).
 
 Everything that makes a hash goes through the chip.  Python's own hashlib is
 only used by the tests, to check the chip's answers.
@@ -31,6 +34,8 @@ import os
 import sys
 import time
 import urllib.parse
+
+OUTER_FILE = os.path.join(os.path.expanduser("~"), ".skykey_outer")
 
 IV = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
 M32 = 0xFFFFFFFF
@@ -151,10 +156,11 @@ def totp_gen(secret: bytes, t: int, step: int = 30, digits: int = 6):
 #
 # HMAC starts both of its hashes with one block made only from the key
 # (key XOR ipad, key XOR opad).  The hash states after those two blocks are
-# the key in pre-mixed form; they are what gets loaded into the chip.  After
-# that, a code needs only public blocks: the time counter (inner hash) and the
-# inner result (outer hash).  The chip starts each from its stored state and
-# does the final addition itself, so the stored states never come back out.
+# the key in pre-mixed form.  The chip keeps the inner state: every code
+# starts with a hash of the (public) time counter from that state, which the
+# chip runs and finishes itself, so the state never comes back out.  The outer
+# state stays with the computer; without the chip's inner result it can't
+# make a code.
 # ---------------------------------------------------------------------------
 
 
@@ -168,35 +174,35 @@ def key_states_gen(key: bytes):
     return inner, outer
 
 
-def key_load_request(inner, outer) -> bytes:
-    """The 40 bytes that follow the 'L' command."""
-    return words_to_bytes(start_values(inner)) + words_to_bytes(start_values(outer))
+def key_load_request(inner) -> bytes:
+    """The 20 bytes that follow the 'L' command."""
+    return words_to_bytes(start_values(inner))
 
 
-def keyed_hmac_gen(msg: bytes):
-    """HMAC with the key the chip holds.
+def keyed_hmac_gen(msg: bytes, outer):
+    """HMAC with the inner key state the chip holds and the outer state given.
 
-    Yields ("I", block), ("O", block) or (state, block) requests; the first
-    two run on the chip's stored inner / outer state.  Any later inner blocks
-    (messages over 55 bytes) continue from a state that is no longer secret.
+    Yields ("I", block) for the block the chip runs on its stored state, and
+    (state, block) for the rest (later message blocks and the outer hash),
+    which start from states that are not secret on their own.
     """
     blocks = pad_blocks(msg, 64)
     state = yield ("I", blocks[0])
     for blk in blocks[1:]:
         state = yield (state, blk)
     (outer_blk,) = pad_blocks(state_bytes(state), 64)
-    state = yield ("O", outer_blk)
+    state = yield (outer, outer_blk)
     return state_bytes(state)
 
 
-def keyed_totp_gen(t: int, step: int = 30, digits: int = 6):
+def keyed_totp_gen(t: int, outer, step: int = 30, digits: int = 6):
     counter = (t // step).to_bytes(8, "big")
-    mac = yield from keyed_hmac_gen(counter)
+    mac = yield from keyed_hmac_gen(counter, outer)
     return truncate(mac, digits)
 
 
 def keyed_request(block: bytes) -> bytes:
-    """The 320 bytes that follow an 'I' or 'O' command."""
+    """The 320 bytes that follow an 'I' command."""
     return words_to_bytes(expand(block))
 
 
@@ -251,29 +257,36 @@ class SkyKeyChip:
     def compress(self, state, block: bytes):
         """Run one 64-byte block through the chip; returns the new hash state.
 
-        state "I" or "O" means: start from the key state the chip holds."""
+        state "I" means: start from the key state the chip holds."""
         assert len(block) == 64
-        if state in ("I", "O"):
-            self.ser.write(state.encode() + keyed_request(block))
+        if state == "I":
+            self.ser.write(b"I" + keyed_request(block))
             return tuple(bytes_to_words(self._expect(20)))
         self.ser.write(b"B" + chip_request(state, block))
         return chip_result(state, self._expect(20))
 
     def load_key(self, secret: bytes):
+        """Load the inner key state into the chip; save the outer state here."""
         inner, outer = drive(key_states_gen(secret), self)
-        self.ser.write(b"L" + key_load_request(inner, outer))
+        self.ser.write(b"L" + key_load_request(inner))
         if self._expect(1) != b"L":
             raise RuntimeError("the chip did not confirm the key load")
+        with open(OUTER_FILE, "w") as f:
+            f.write(state_bytes(outer).hex())
 
     def wipe(self):
         self.ser.write(b"Z")
         if self._expect(1) != b"Z":
             raise RuntimeError("the chip did not confirm the wipe")
+        if os.path.exists(OUTER_FILE):
+            os.remove(OUTER_FILE)
 
     def code(self, t=None, step: int = 30, digits: int = 6) -> str:
         """A login code from the key the chip holds."""
+        with open(OUTER_FILE) as f:
+            outer = tuple(bytes_to_words(bytes.fromhex(f.read().strip())))
         t = int(time.time()) if t is None else t
-        return drive(keyed_totp_gen(t, step, digits), self)
+        return drive(keyed_totp_gen(t, outer, step, digits), self)
 
     def sha1(self, data: bytes) -> bytes:
         return drive(sha1_gen(data), self)

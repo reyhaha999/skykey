@@ -4,12 +4,13 @@
  *
  * SkyKey: a login-code (TOTP) key chip built around a bit-serial SHA-1 engine.
  *
- * The secret lives on the chip.  At enrollment the computer loads the key in
- * HMAC's pre-mixed form (the two hash states after the key blocks, "inner"
- * and "outer").  From then on the chip does every step that touches them:
- * it starts each keyed hash from a stored state and does the final addition
- * itself, so neither state ever leaves the chip.  The computer only handles
- * public data (the time counter and the padding around it).
+ * The secret lives on the chip.  HMAC turns a key into two hash states
+ * ("inner" and "outer", the states after its two key blocks).  The chip keeps
+ * the inner one: every login code starts with a hash from that state, and the
+ * chip finishes that hash itself, so the state never leaves the chip and no
+ * code can be made without it.  The outer state, useless on its own, stays
+ * with the computer.  The computer only sends public data (the time counter
+ * and the padding around it).
  *
  * Serial link: 115,200 baud, 8N1, 10 MHz clock.
  *
@@ -21,11 +22,11 @@
  *           320 bytes   the 80 message words W0..W79            (big endian words)
  *         and the chip replies with 20 bytes: the five values a80..a76.
  *         (host/skykey.py does the message expansion and the final addition.)
- *   'L'   load the key: 20 bytes inner state + 20 bytes outer state, both as
- *         starting values (same format as 'B').  Replies 'L'.
- *   'I'   keyed block with the inner state.  The computer sends the 320 bytes
- *         of message words; the chip replies with the finished 20-byte hash.
- *   'O'   the same with the outer state.
+ *   'L'   load the key: the 20-byte inner state as starting values (same
+ *         format as 'B').  Replies 'L'.
+ *   'I'   keyed block: the computer sends 320 bytes of message words; the chip
+ *         runs them from the stored state and replies with the finished
+ *         20-byte hash (final addition done on chip).
  *   'Z'   wipe the key.  Replies 'Z'.  (The key is also gone at power-off.)
  */
 
@@ -100,21 +101,18 @@ module tt_um_reyhaha999_skykey (
   );
 
   // --------------------------------------------------------------- key store
-  // Two 192-bit rings, one for each pre-mixed key state.  They turn in step
-  // with the working ring (same length, same clock), so word slot q of a key
-  // ring always lines up with word slot q of the working ring.  Like the
-  // working ring they have no reset and no enable: the cheapest flops.
-  // Nothing ever shifts a key ring out of a pin; it only feeds the working
-  // ring (to start a keyed hash) and the final adder.
-  reg  [191:0] ki, ko;
-  reg          ksel;  // which state a keyed run or a load uses: 0 inner, 1 outer
+  // A 192-bit ring holding the inner key state.  It turns in step with the
+  // working ring (same length, same clock), so word slot q of the key ring
+  // always lines up with word slot q of the working ring.  Like the working
+  // ring it has no reset and no enable: the cheapest flops.  Nothing ever
+  // shifts it out of a pin; it only feeds the working ring (to start a keyed
+  // hash) and the final adder.
+  reg  [191:0] kt;
   wire         k_ins, k_zero;
   wire         k_bit;
-  wire [191:0] kt = ksel ? ko : ki;
 
   always @(posedge clk) begin
-    ki <= {k_zero ? 1'b0 : (k_ins & ~ksel) ? k_bit : ki[0], ki[191:1]};
-    ko <= {k_zero ? 1'b0 : (k_ins & ksel) ? k_bit : ko[0], ko[191:1]};
+    kt <= {k_zero ? 1'b0 : k_ins ? k_bit : kt[0], kt[191:1]};
   end
 
   // ----------------------------------------------------------- self-test data
@@ -133,10 +131,10 @@ module tt_um_reyhaha999_skykey (
                    C_LD   = 3'd1,  // 'B'/'T': starting values into the working ring
                    C_WR   = 3'd2,  // 80 message words, rounds running
                    C_TXD  = 3'd3,  // 'B'/'T': read the raw result back out
-                   C_KEY  = 3'd4,  // 'L': key states into the key rings
-                   C_KL   = 3'd5,  // 'I'/'O': copy a key ring into the working ring
-                   C_KADD = 3'd6,  // 'I'/'O': final addition on chip, then send
-                   C_ZERO = 3'd7;  // 'Z': wipe both key rings
+                   C_KEY  = 3'd4,  // 'L': key state into the key ring
+                   C_KL   = 3'd5,  // 'I': copy the key ring into the working ring
+                   C_KADD = 3'd6,  // 'I': final addition on chip, then send
+                   C_ZERO = 3'd7;  // 'Z': wipe the key ring
 
   reg [2:0] cs;
   reg       pending;  // a received byte is waiting for its slot
@@ -144,7 +142,7 @@ module tt_um_reyhaha999_skykey (
   reg       capping;  // capturing a result byte (8 clocks)
   reg       mism;
   reg [1:0] res;  // 0 none, 1 pass, 2 fail
-  reg       kmode;  // this run is keyed ('I' or 'O')
+  reg       kmode;  // this run is keyed ('I')
   reg       kact;  // a copy, wipe or add window is running
   reg       kready;  // a finished keyed word is waiting in the message ring
   reg       kc;  // carry of the final adder
@@ -185,7 +183,7 @@ module tt_um_reyhaha999_skykey (
   wire ins_bit = ins_byte[bi];
   wire ins_last = ins_act & (bi == 3'd7);
 
-  // ---- full-turn windows: copy a key ring into the working ring, or wipe ----
+  // ---- full-turn windows: copy the key ring into the working ring, or wipe ----
   wire turn_win = ((cs == C_KL) | (cs == C_ZERO)) & (kact | turn0);
   wire copy_now = (cs == C_KL) & turn_win;
   assign k_zero = (cs == C_ZERO) & turn_win;
@@ -197,7 +195,7 @@ module tt_um_reyhaha999_skykey (
 
   // ---- final addition for keyed runs ----
   // Result word m (= n[4:2]) passes in slot q_rd; the matching key word was
-  // loaded four slots later, so it sits 128 bits further up its key ring.
+  // loaded four slots later, so it sits 128 bits further up the key ring.
   // SHA-1 adds words 2..4 in rotated form (rotl30), so for those the adder
   // reads both inputs two bits ahead, and picks up bits 0 and 1 again as they
   // come back around (the rotation is just a choice of tap).  The sum goes
@@ -238,7 +236,6 @@ module tt_um_reyhaha999_skykey (
       bist         <= 1'b0;
       send_pending <= 1'b0;
       cap          <= 8'd0;
-      ksel         <= 1'b0;
       kmode        <= 1'b0;
       kact         <= 1'b0;
       kready       <= 1'b0;
@@ -280,18 +277,9 @@ module tt_um_reyhaha999_skykey (
                 mism  <= 1'b0;
                 kmode <= 1'b0;
               end
-              "L": begin
-                cs   <= C_KEY;
-                ksel <= 1'b0;
-              end
+              "L": cs <= C_KEY;
               "I": begin
                 cs    <= C_KL;
-                ksel  <= 1'b0;
-                kmode <= 1'b1;
-              end
-              "O": begin
-                cs    <= C_KL;
-                ksel  <= 1'b1;
                 kmode <= 1'b1;
               end
               "Z": cs <= C_ZERO;
@@ -310,22 +298,19 @@ module tt_um_reyhaha999_skykey (
             end
           end
         end
-        C_KEY: begin  // 20 bytes into the inner key ring, then 20 into the outer
+        C_KEY: begin  // 20 bytes into the key ring
           if (ins_last) begin
             pending <= 1'b0;
             n       <= n + 5'd1;
             if (n == 5'd19) begin
-              n <= 5'd0;
-              if (!ksel) ksel <= 1'b1;
-              else begin
-                cs           <= C_IDLE;
-                cap          <= 8'h4C;  // 'L'
-                send_pending <= 1'b1;
-              end
+              n            <= 5'd0;
+              cs           <= C_IDLE;
+              cap          <= 8'h4C;  // 'L'
+              send_pending <= 1'b1;
             end
           end
         end
-        C_KL: begin  // one full turn: the chosen key ring becomes the working ring
+        C_KL: begin  // one full turn: the key ring becomes the working ring
           if (turn0) kact <= 1'b1;
           if (kact & turnend) begin
             kact <= 1'b0;
@@ -334,7 +319,7 @@ module tt_um_reyhaha999_skykey (
             cs   <= C_WR;
           end
         end
-        C_ZERO: begin  // one full turn of zeros into both key rings
+        C_ZERO: begin  // one full turn of zeros into the key ring
           if (turn0) kact <= 1'b1;
           if (kact & turnend) begin
             kact         <= 1'b0;

@@ -67,16 +67,18 @@ class SimChip:
 
     async def compress(self, state, block: bytes):
         """Run one block through the chip; returns the new hash state.
-        state "I" / "O" runs the block on the key state the chip holds."""
-        if state in ("I", "O"):
-            reply = await self.ask(state.encode() + skykey.keyed_request(block), 20)
+        state "I" runs the block on the key state the chip holds."""
+        if state == "I":
+            reply = await self.ask(b"I" + skykey.keyed_request(block), 20)
             return tuple(skykey.bytes_to_words(reply))
         reply = await self.ask(b"B" + skykey.chip_request(state, block), 20)
         return skykey.chip_result(state, reply)
 
     async def load_key(self, secret: bytes):
+        """Load the inner state into the chip; returns the outer state (kept by the host)."""
         inner, outer = await skykey.adrive(skykey.key_states_gen(secret), self)
-        assert await self.ask(b"L" + skykey.key_load_request(inner, outer), 1) == b"L"
+        assert await self.ask(b"L" + skykey.key_load_request(inner), 1) == b"L"
+        return outer
 
     async def wipe(self):
         assert await self.ask(b"Z", 1) == b"Z"
@@ -199,15 +201,15 @@ async def test_onchip_key_totp(dut):
     """Key held on the chip: login codes match RFC 6238, and the key survives
     other work (plain hashes) in between."""
     chip = await start_chip(dut)
-    await chip.load_key(b"12345678901234567890")
+    outer = await chip.load_key(b"12345678901234567890")
     vectors = RFC6238[:1] if GATES else RFC6238
     for t, want in vectors:
-        got = await skykey.adrive(skykey.keyed_totp_gen(t, digits=8), chip)
+        got = await skykey.adrive(skykey.keyed_totp_gen(t, outer, digits=8), chip)
         assert got == want, f"on-chip key TOTP at t={t}: {got} != {want}"
         dut._log.info(f"on-chip key totp t={t} -> {got} ok")
     # a plain hash in between must not disturb the stored key
     assert await skykey.adrive(skykey.sha1_gen(b"abc"), chip) == hashlib.sha1(b"abc").digest()
-    assert await skykey.adrive(skykey.keyed_totp_gen(59, digits=6), chip) == "287082"
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=6), chip) == "287082"
 
 
 @cocotb.test()
@@ -227,8 +229,8 @@ async def test_onchip_key_hmac_rfc2202(dut):
     if GATES:
         cases = cases[:1]
     for key, msg, want in cases:
-        await chip.load_key(key)
-        got = await skykey.adrive(skykey.keyed_hmac_gen(msg), chip)
+        outer = await chip.load_key(key)
+        got = await skykey.adrive(skykey.keyed_hmac_gen(msg, outer), chip)
         assert got.hex() == want, f"on-chip key HMAC mismatch: {got.hex()} != {want}"
         assert got == pyhmac.new(key, msg, hashlib.sha1).digest()
         dut._log.info(f"on-chip key hmac key={len(key)}B msg={len(msg)}B ok")
@@ -239,16 +241,15 @@ async def test_wipe(dut):
     """'Z' wipes the key: codes stop matching until a key is loaded again."""
     chip = await start_chip(dut)
     secret = b"12345678901234567890"
-    await chip.load_key(secret)
-    assert await skykey.adrive(skykey.keyed_totp_gen(59, digits=8), chip) == "94287082"
+    outer = await chip.load_key(secret)
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=8), chip) == "94287082"
     await chip.wipe()
-    # after a wipe both stored states are zero
-    zero = await skykey.adrive(skykey.keyed_hmac_gen(b"x"), chip)
-    inner = sw_compress((0, 0, 0, 0, 0), skykey.pad_blocks(b"x", 64)[0])
-    outer = sw_compress((0, 0, 0, 0, 0), skykey.pad_blocks(skykey.state_bytes(inner), 64)[0])
-    assert zero == skykey.state_bytes(outer), "wipe did not clear the key"
-    await chip.load_key(secret)
-    assert await skykey.adrive(skykey.keyed_totp_gen(59, digits=8), chip) == "94287082"
+    # after a wipe the stored state is zero
+    blk = skykey.pad_blocks(b"x", 64)[0]
+    got = await chip.compress("I", blk)
+    assert got == sw_compress((0, 0, 0, 0, 0), blk), "wipe did not clear the key"
+    outer = await chip.load_key(secret)
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=8), chip) == "94287082"
 
 
 def sw_compress(state, block):
