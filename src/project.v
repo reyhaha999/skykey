@@ -12,7 +12,9 @@
  * with the computer.  The computer only sends public data (the time counter
  * and the padding around it).
  *
- * Serial link: 115,200 baud, 8N1, 10 MHz clock.
+ * Serial link: 115,200 baud, 8N1, 10 MHz clock, on the Tiny Tapeout demo
+ * board's standard serial pins (RX ui_in[3], TX uo_out[4]), so the board's
+ * RP2040 can carry it over USB.
  *
  *   '?'   chip replies 'K'
  *   'T'   self-test: the chip runs a known block through itself and checks the
@@ -57,7 +59,7 @@ module tt_um_reyhaha999_skykey (
   uart_rx u_rx (
       .clk(clk),
       .rst(rst),
-      .rx(ui_in[0]),
+      .rx(ui_in[3]),
       .data(rx_data),
       .valid(rx_valid)
   );
@@ -387,13 +389,16 @@ module tt_um_reyhaha999_skykey (
     if (busy_any) seg = 7'b1110110;  // H (hashing)
     else if (res == 2'd1) seg = 7'b1110011;  // P (pass)
     else if (res == 2'd2) seg = 7'b1110001;  // F (fail)
-    else seg = 7'b1000000;  // -
+    else seg = 7'b1010000;  // r (ready)
   end
 
-  assign uo_out  = {busy_any, seg};
-  assign uio_out = {7'b0, tx_line};
-  assign uio_oe  = 8'b00000001;
+  // Segment E doubles as the serial TX line (the demo board's standard TX
+  // pin).  The serial line rests high, so E is lit whenever nothing is being
+  // sent; every letter shown (H, P, F, r) uses E, so the display reads right.
+  assign uo_out  = {busy_any, seg[6:5], tx_line, seg[3:0]};
+  assign uio_out = 8'b0;
+  assign uio_oe  = 8'b0;
 
-  wire _unused = &{ena, ui_in[7:1], uio_in, core_busy, rnd, 1'b0};
+  wire _unused = &{ena, ui_in[7:4], ui_in[2:0], uio_in, core_busy, rnd, seg[4], 1'b0};
 
 endmodule

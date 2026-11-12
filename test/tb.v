@@ -32,7 +32,7 @@ module tb ();
 `endif
 
   // Serial data out of the chip
-  wire serial_tx = uio_out[0];
+  wire serial_tx = uo_out[4];
 
   tt_um_reyhaha999_skykey user_project (
 
