@@ -34,12 +34,12 @@ class SimChip:
 
     async def send(self, data: bytes):
         for byte in data:
-            self.dut.ui_in.value = 0x00  # start bit
+            self.dut.ui_in.value = 0x00  # start bit (RX is ui_in[3])
             await Timer(BIT_NS, unit="ns")
             for i in range(8):
-                self.dut.ui_in.value = (byte >> i) & 1
+                self.dut.ui_in.value = ((byte >> i) & 1) << 3
                 await Timer(BIT_NS, unit="ns")
-            self.dut.ui_in.value = 0x01  # stop bit
+            self.dut.ui_in.value = 0x08  # stop bit
             await Timer(BIT_NS, unit="ns")
 
     async def recv(self, n: int) -> bytes:
@@ -86,7 +86,7 @@ class SimChip:
 
 async def start_chip(dut) -> SimChip:
     dut.ena.value = 1
-    dut.ui_in.value = 0x01
+    dut.ui_in.value = 0x08  # serial line idle (high) on RX = ui_in[3]
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 20)
@@ -97,7 +97,7 @@ async def start_chip(dut) -> SimChip:
 
 def seg_text(dut) -> str:
     v = int(dut.uo_out.value) & 0x7F
-    return {0b1000000: "-", 0b1110011: "P", 0b1110001: "F", 0b1110110: "H"}.get(v, hex(v))
+    return {0b1010000: "r", 0b1110011: "P", 0b1110001: "F", 0b1110110: "H"}.get(v, hex(v))
 
 
 @cocotb.test()
@@ -105,7 +105,7 @@ async def test_ping_and_selftest(dut):
     """The chip answers '?', and its built-in self-test (hash 'abc') passes."""
     chip = await start_chip(dut)
     assert await chip.ping() == b"K"
-    assert seg_text(dut) == "-"
+    assert seg_text(dut) == "r"
     assert await chip.ask(b"T", 1) == b"P", "built-in self-test failed"
     assert seg_text(dut) == "P"
 

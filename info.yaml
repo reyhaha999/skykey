@@ -25,10 +25,10 @@ project:
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: "RX (serial in, 115200 baud)"
+  ui[0]: ""
   ui[1]: ""
   ui[2]: ""
-  ui[3]: ""
+  ui[3]: "RX (serial in, 115200 baud)"
   ui[4]: ""
   ui[5]: ""
   ui[6]: ""
@@ -39,13 +39,13 @@ pinout:
   uo[1]: "SEG_B"
   uo[2]: "SEG_C"
   uo[3]: "SEG_D"
-  uo[4]: "SEG_E"
+  uo[4]: "SEG_E / TX (serial out, 115200 baud)"
   uo[5]: "SEG_F"
   uo[6]: "SEG_G"
   uo[7]: "BUSY (hashing)"
 
   # Bidirectional pins
-  uio[0]: "TX (serial out, 115200 baud)"
+  uio[0]: ""
   uio[1]: ""
   uio[2]: ""
   uio[3]: ""

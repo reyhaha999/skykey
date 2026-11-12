@@ -14,7 +14,7 @@ Inside is a bit-serial SHA-1 engine, the hash behind HMAC and TOTP. SHA-1 turns 
 
 **What the computer still does.** It expands each public block into the 80 message words SHA-1 needs and streams them in, and runs the outer hash on the chip's inner result.
 
-Serial protocol (115,200 baud, 8N1, 10 MHz clock):
+Serial protocol (115,200 baud, 8N1, 10 MHz clock) on the demo board's standard serial pins, RX = ui[3] and TX = uo[4], so the board's RP2040 carries it over USB:
 
 | Byte | Meaning |
 |------|---------|
@@ -25,7 +25,7 @@ Serial protocol (115,200 baud, 8N1, 10 MHz clock):
 | `Z`  | Wipe the key; replies `Z` |
 | `B`  | Plain hash, no key: 20 start-value bytes and 320 message-word bytes; replies with 20 bytes |
 
-The 7-segment display shows H while hashing, P after a pass, F after a fail, and a dash when idle.
+The 7-segment display shows H while hashing, P after a pass, F after a fail, and r (ready) when idle. Segment E doubles as the serial TX line; it rests high, and every letter shown uses it.
 
 ## How to test
 
@@ -37,4 +37,4 @@ This is a design demonstration, not a certified security key. The chip has no pe
 
 ## External hardware
 
-A USB-serial adapter (or an RP2040/ESP32) wired to RX (ui[0]) and TX (uio[0]). Optional: a 7-segment display on uo[0..6].
+The Tiny Tapeout demo board: its RP2040 provides the 10 MHz clock and the serial link over USB (RX ui[3], TX uo[4]), and its 7-segment display shows status. Any other USB-serial adapter wired to those two pins works too.
