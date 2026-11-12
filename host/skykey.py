@@ -2,18 +2,30 @@
 """
 SkyKey host program.
 
-The chip is a SHA-1 hash engine.  This program does the rest: it pads
-messages, builds HMAC and one-time login codes (TOTP, RFC 6238) out of
-chip hashes, and feeds the chip a photo of the real sky to make a secret.
+The chip is a login-code key: it holds a secret and makes one-time login
+codes (TOTP, RFC 6238) from it.  The secret is made from a photo of the sky
+taken with your own camera: the sensor noise in that photo is randomness only
+you have.
+
+Enrollment (once): the chip hashes your sky photo (mixed with your computer's
+own randomness) into a secret.  The secret is shown once, as a QR link for
+your authenticator app.  HMAC turns it into two hash states; the inner one is
+loaded into the chip and the outer one is saved on this computer, then the
+secret itself is forgotten.  Every login code starts with a hash only the chip
+can make, so no code can be made without the chip; the saved outer state is
+useless on its own.  This program only ever sends the chip public data (the
+time counter).
 
 Everything that makes a hash goes through the chip.  Python's own hashlib is
 only used by the tests, to check the chip's answers.
 
 Usage:
     python3 skykey.py --port /dev/ttyUSB0 selftest
+    python3 skykey.py --port /dev/ttyUSB0 enroll --image sky.jpg --name me@example.com
+    python3 skykey.py --port /dev/ttyUSB0 code
+    python3 skykey.py --port /dev/ttyUSB0 wipe
     python3 skykey.py --port /dev/ttyUSB0 sha1 "hello"
     python3 skykey.py --port /dev/ttyUSB0 totp --secret JBSWY3DPEHPK3PXP
-    python3 skykey.py --port /dev/ttyUSB0 enroll --name me@example.com
 """
 
 import argparse
@@ -22,15 +34,11 @@ import os
 import sys
 import time
 import urllib.parse
-import urllib.request
+
+OUTER_FILE = os.path.join(os.path.expanduser("~"), ".skykey_outer")
 
 IV = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
 M32 = 0xFFFFFFFF
-
-SKY_URLS = [
-    "https://sgo.fi/Data/RealTime/Kuvat/SOD.jpg",
-    "https://astroweb.unisq.edu.au/ops/Allsky/image_29.jpg",
-]
 
 
 def rol(x: int, n: int) -> int:
@@ -143,6 +151,61 @@ def totp_gen(secret: bytes, t: int, step: int = 30, digits: int = 6):
     return truncate(mac, digits)
 
 
+# ---------------------------------------------------------------------------
+# Keyed recipes: the chip holds the key.
+#
+# HMAC starts both of its hashes with one block made only from the key
+# (key XOR ipad, key XOR opad).  The hash states after those two blocks are
+# the key in pre-mixed form.  The chip keeps the inner state: every code
+# starts with a hash of the (public) time counter from that state, which the
+# chip runs and finishes itself, so the state never comes back out.  The outer
+# state stays with the computer; without the chip's inner result it can't
+# make a code.
+# ---------------------------------------------------------------------------
+
+
+def key_states_gen(key: bytes):
+    """The two pre-mixed states for an HMAC key (made with chip hashes)."""
+    if len(key) > 64:
+        key = yield from sha1_gen(key)
+    key = key.ljust(64, b"\x00")
+    inner = yield (IV, bytes(x ^ 0x36 for x in key))
+    outer = yield (IV, bytes(x ^ 0x5C for x in key))
+    return inner, outer
+
+
+def key_load_request(inner) -> bytes:
+    """The 20 bytes that follow the 'L' command."""
+    return words_to_bytes(start_values(inner))
+
+
+def keyed_hmac_gen(msg: bytes, outer):
+    """HMAC with the inner key state the chip holds and the outer state given.
+
+    Yields ("I", block) for the block the chip runs on its stored state, and
+    (state, block) for the rest (later message blocks and the outer hash),
+    which start from states that are not secret on their own.
+    """
+    blocks = pad_blocks(msg, 64)
+    state = yield ("I", blocks[0])
+    for blk in blocks[1:]:
+        state = yield (state, blk)
+    (outer_blk,) = pad_blocks(state_bytes(state), 64)
+    state = yield (outer, outer_blk)
+    return state_bytes(state)
+
+
+def keyed_totp_gen(t: int, outer, step: int = 30, digits: int = 6):
+    counter = (t // step).to_bytes(8, "big")
+    mac = yield from keyed_hmac_gen(counter, outer)
+    return truncate(mac, digits)
+
+
+def keyed_request(block: bytes) -> bytes:
+    """The 320 bytes that follow an 'I' command."""
+    return words_to_bytes(expand(block))
+
+
 def drive(gen, chip):
     """Run a recipe against a synchronous chip object."""
     try:
@@ -192,10 +255,38 @@ class SkyKeyChip:
         return self._expect(1) == b"P"
 
     def compress(self, state, block: bytes):
-        """Run one 64-byte block through the chip; returns the new hash state."""
+        """Run one 64-byte block through the chip; returns the new hash state.
+
+        state "I" means: start from the key state the chip holds."""
         assert len(block) == 64
+        if state == "I":
+            self.ser.write(b"I" + keyed_request(block))
+            return tuple(bytes_to_words(self._expect(20)))
         self.ser.write(b"B" + chip_request(state, block))
         return chip_result(state, self._expect(20))
+
+    def load_key(self, secret: bytes):
+        """Load the inner key state into the chip; save the outer state here."""
+        inner, outer = drive(key_states_gen(secret), self)
+        self.ser.write(b"L" + key_load_request(inner))
+        if self._expect(1) != b"L":
+            raise RuntimeError("the chip did not confirm the key load")
+        with open(OUTER_FILE, "w") as f:
+            f.write(state_bytes(outer).hex())
+
+    def wipe(self):
+        self.ser.write(b"Z")
+        if self._expect(1) != b"Z":
+            raise RuntimeError("the chip did not confirm the wipe")
+        if os.path.exists(OUTER_FILE):
+            os.remove(OUTER_FILE)
+
+    def code(self, t=None, step: int = 30, digits: int = 6) -> str:
+        """A login code from the key the chip holds."""
+        with open(OUTER_FILE) as f:
+            outer = tuple(bytes_to_words(bytes.fromhex(f.read().strip())))
+        t = int(time.time()) if t is None else t
+        return drive(keyed_totp_gen(t, outer, step, digits), self)
 
     def sha1(self, data: bytes) -> bytes:
         return drive(sha1_gen(data), self)
@@ -213,26 +304,12 @@ class SkyKeyChip:
 # ---------------------------------------------------------------------------
 
 
-def fetch_sky_image():
-    errors = []
-    for url in SKY_URLS:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "skykey", "Cache-Control": "no-cache"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                image = resp.read()
-            if not image.startswith(b"\xff\xd8"):
-                raise ValueError("not a JPEG image")
-            return image, url
-        except Exception as e:  # try the next camera
-            errors.append(f"{url}: {e}")
-    raise RuntimeError("; ".join(errors))
-
-
 def make_secret(chip: SkyKeyChip, image: bytes, local_noise: bytes = b"") -> bytes:
     """Squeeze a 20-byte secret out of a sky photo, using the chip's hash.
 
-    A public sky photo is public, so mix in noise only you have (for example a
-    frame from your own camera, or os.urandom) before treating it as secret.
+    The photo should come from your own camera: its sensor noise is the
+    randomness.  The computer's own randomness is mixed in as well, so the
+    secret stays strong even if the photo were ever seen by someone else.
     """
     return chip.sha1(image + local_noise + time.time_ns().to_bytes(8, "little"))
 
@@ -242,14 +319,18 @@ def main():
     ap.add_argument("--port", required=True)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("selftest")
-    p = sub.add_parser("sha1")
-    p.add_argument("text")
-    p = sub.add_parser("totp")
-    p.add_argument("--secret", required=True, help="base32 secret, like an authenticator app uses")
-    p.add_argument("--digits", type=int, default=6)
     p = sub.add_parser("enroll")
+    p.add_argument("--image", required=True, help="a photo of the sky from your own camera")
     p.add_argument("--name", default="skykey")
     p.add_argument("--issuer", default="SkyKey")
+    p = sub.add_parser("code")
+    p.add_argument("--digits", type=int, default=6)
+    sub.add_parser("wipe")
+    p = sub.add_parser("sha1")
+    p.add_argument("text")
+    p = sub.add_parser("totp", help="code from a secret you type in (the key is not stored on the chip)")
+    p.add_argument("--secret", required=True, help="base32 secret, like an authenticator app uses")
+    p.add_argument("--digits", type=int, default=6)
     args = ap.parse_args()
 
     chip = SkyKeyChip(args.port)
@@ -257,20 +338,28 @@ def main():
         ok = chip.selftest()
         print("self-test:", "PASS" if ok else "FAIL")
         sys.exit(0 if ok else 1)
+    if args.cmd == "enroll":
+        with open(args.image, "rb") as f:
+            image = f.read()
+        secret = make_secret(chip, image, os.urandom(16))
+        chip.load_key(secret)
+        b32 = base64.b32encode(secret).decode().rstrip("=")
+        label = urllib.parse.quote(f"{args.issuer}:{args.name}")
+        print(f"sky photo: {len(image)} bytes from {args.image}")
+        print("add this to your authenticator app (shown once):")
+        print(f"otpauth://totp/{label}?secret={b32}&issuer={urllib.parse.quote(args.issuer)}&algorithm=SHA1&digits=6&period=30")
+        del secret, b32
+        print("first code from the chip:", chip.code())
+    if args.cmd == "code":
+        print(chip.code(digits=args.digits))
+    if args.cmd == "wipe":
+        chip.wipe()
+        print("key wiped")
     if args.cmd == "sha1":
         print(chip.sha1(args.text.encode()).hex())
     if args.cmd == "totp":
         secret = base64.b32decode(args.secret.replace(" ", "").upper() + "=" * (-len(args.secret) % 8))
         print(chip.totp(secret, digits=args.digits))
-    if args.cmd == "enroll":
-        image, url = fetch_sky_image()
-        secret = make_secret(chip, image, os.urandom(16))
-        b32 = base64.b32encode(secret).decode().rstrip("=")
-        label = urllib.parse.quote(f"{args.issuer}:{args.name}")
-        print(f"sky image: {len(image)} bytes from {url}")
-        print(f"secret (base32): {b32}")
-        print(f"otpauth://totp/{label}?secret={b32}&issuer={urllib.parse.quote(args.issuer)}&algorithm=SHA1&digits=6&period=30")
-        print("first code:", chip.totp(secret))
 
 
 if __name__ == "__main__":

@@ -66,9 +66,22 @@ class SimChip:
         return await self.ask(b"?", 1)
 
     async def compress(self, state, block: bytes):
-        """Run one block through the chip; returns the new hash state."""
+        """Run one block through the chip; returns the new hash state.
+        state "I" runs the block on the key state the chip holds."""
+        if state == "I":
+            reply = await self.ask(b"I" + skykey.keyed_request(block), 20)
+            return tuple(skykey.bytes_to_words(reply))
         reply = await self.ask(b"B" + skykey.chip_request(state, block), 20)
         return skykey.chip_result(state, reply)
+
+    async def load_key(self, secret: bytes):
+        """Load the inner state into the chip; returns the outer state (kept by the host)."""
+        inner, outer = await skykey.adrive(skykey.key_states_gen(secret), self)
+        assert await self.ask(b"L" + skykey.key_load_request(inner), 1) == b"L"
+        return outer
+
+    async def wipe(self):
+        assert await self.ask(b"Z", 1) == b"Z"
 
 
 async def start_chip(dut) -> SimChip:
@@ -171,6 +184,72 @@ async def test_random_blocks(dut):
         block = os.urandom(64)
         got = await chip.compress(state, block)
         assert got == sw_compress(state, block), "chip and software model disagree"
+
+
+RFC6238 = [
+    (59, "94287082"),
+    (1111111109, "07081804"),
+    (1111111111, "14050471"),
+    (1234567890, "89005924"),
+    (2000000000, "69279037"),
+    (20000000000, "65353130"),
+]
+
+
+@cocotb.test()
+async def test_onchip_key_totp(dut):
+    """Key held on the chip: login codes match RFC 6238, and the key survives
+    other work (plain hashes) in between."""
+    chip = await start_chip(dut)
+    outer = await chip.load_key(b"12345678901234567890")
+    vectors = RFC6238[:1] if GATES else RFC6238
+    for t, want in vectors:
+        got = await skykey.adrive(skykey.keyed_totp_gen(t, outer, digits=8), chip)
+        assert got == want, f"on-chip key TOTP at t={t}: {got} != {want}"
+        dut._log.info(f"on-chip key totp t={t} -> {got} ok")
+    # a plain hash in between must not disturb the stored key
+    assert await skykey.adrive(skykey.sha1_gen(b"abc"), chip) == hashlib.sha1(b"abc").digest()
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=6), chip) == "287082"
+
+
+@cocotb.test()
+async def test_onchip_key_hmac_rfc2202(dut):
+    """HMAC with the key held on the chip, against RFC 2202 (including a key
+    longer than a block and a message longer than a block)."""
+    chip = await start_chip(dut)
+    cases = [
+        (b"\x0b" * 20, b"Hi There", "b617318655057264e28bc0b6fb378c8ef146be00"),
+        (b"Jefe", b"what do ya want for nothing?", "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79"),
+        (
+            b"\xaa" * 80,
+            b"Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data",
+            "e8e99d0f45237d786d6bbaa7965c7808bbff1a91",
+        ),
+    ]
+    if GATES:
+        cases = cases[:1]
+    for key, msg, want in cases:
+        outer = await chip.load_key(key)
+        got = await skykey.adrive(skykey.keyed_hmac_gen(msg, outer), chip)
+        assert got.hex() == want, f"on-chip key HMAC mismatch: {got.hex()} != {want}"
+        assert got == pyhmac.new(key, msg, hashlib.sha1).digest()
+        dut._log.info(f"on-chip key hmac key={len(key)}B msg={len(msg)}B ok")
+
+
+@cocotb.test()
+async def test_wipe(dut):
+    """'Z' wipes the key: codes stop matching until a key is loaded again."""
+    chip = await start_chip(dut)
+    secret = b"12345678901234567890"
+    outer = await chip.load_key(secret)
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=8), chip) == "94287082"
+    await chip.wipe()
+    # after a wipe the stored state is zero
+    blk = skykey.pad_blocks(b"x", 64)[0]
+    got = await chip.compress("I", blk)
+    assert got == sw_compress((0, 0, 0, 0, 0), blk), "wipe did not clear the key"
+    outer = await chip.load_key(secret)
+    assert await skykey.adrive(skykey.keyed_totp_gen(59, outer, digits=8), chip) == "94287082"
 
 
 def sw_compress(state, block):

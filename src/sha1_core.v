@@ -43,6 +43,9 @@ module sha1_core (
     output reg  [4:0] j,
     output reg  [2:0] q,
     output wire       vout,     // bit leaving the working ring (for reading results)
+    output wire       vout2,    // the bit two places behind it (for rotated reads)
+    output wire       vout162,  // the same word's low bits, coming around again
+    output wire       wout,     // bit leaving the message ring (scratch word for keyed results)
     output reg        wvalid,   // a word is waiting for its round
     output reg  [6:0] rnd,      // rounds finished so far
     output reg        done,     // pulse after round 79
@@ -63,6 +66,9 @@ module sha1_core (
   wire wv = wvalid | wz;
 
   assign vout = v[0];
+  assign vout2 = v[2];
+  assign vout162 = v[162];
+  assign wout = wr[0];
   assign busy = armed;
 
   // ---- taps into the working ring ----
