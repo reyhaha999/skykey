@@ -30,12 +30,51 @@ Usage:
 
 import argparse
 import base64
+import getpass
+import hashlib
+import hmac as hmac_mod
 import os
 import sys
 import time
 import urllib.parse
 
 OUTER_FILE = os.path.join(os.path.expanduser("~"), ".skykey_outer")
+BACKUP_FILE = os.path.join(os.path.expanduser("~"), ".skykey_backup")
+
+# The chip keeps its key in flip-flops, so it forgets it whenever it loses
+# power.  To survive that, enroll can save the chip's inner key state here,
+# locked with a passphrase (scrypt + an HMAC check).  "restore" puts it back
+# after a power cycle.  Without the passphrase the file is useless; with it,
+# the file plus the outer state can make codes, so pick a real passphrase.
+
+
+def _backup_keys(passphrase: str, salt: bytes):
+    k = hashlib.scrypt(passphrase.encode(), salt=salt, n=2**15, r=8, p=1, maxmem=2**26, dklen=64)
+    return k[:32], k[32:]
+
+
+def _keystream(key: bytes, n: int) -> bytes:
+    out, i = b"", 0
+    while len(out) < n:
+        out += hmac_mod.new(key, i.to_bytes(4, "big"), hashlib.sha256).digest()
+        i += 1
+    return out[:n]
+
+
+def seal_inner(inner_bytes: bytes, passphrase: str) -> bytes:
+    salt = os.urandom(16)
+    ek, mk = _backup_keys(passphrase, salt)
+    body = bytes(a ^ b for a, b in zip(inner_bytes, _keystream(ek, len(inner_bytes))))
+    tag = hmac_mod.new(mk, salt + body, hashlib.sha256).digest()
+    return salt + body + tag
+
+
+def open_inner(blob: bytes, passphrase: str) -> bytes:
+    salt, body, tag = blob[:16], blob[16:-32], blob[-32:]
+    ek, mk = _backup_keys(passphrase, salt)
+    if not hmac_mod.compare_digest(tag, hmac_mod.new(mk, salt + body, hashlib.sha256).digest()):
+        raise ValueError("wrong passphrase or damaged backup")
+    return bytes(a ^ b for a, b in zip(body, _keystream(ek, len(body))))
 
 IV = (0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0)
 M32 = 0xFFFFFFFF
@@ -265,21 +304,37 @@ class SkyKeyChip:
         self.ser.write(b"B" + chip_request(state, block))
         return chip_result(state, self._expect(20))
 
-    def load_key(self, secret: bytes):
-        """Load the inner key state into the chip; save the outer state here."""
-        inner, outer = drive(key_states_gen(secret), self)
+    def _send_inner(self, inner):
         self.ser.write(b"L" + key_load_request(inner))
         if self._expect(1) != b"L":
             raise RuntimeError("the chip did not confirm the key load")
+
+    def load_key(self, secret: bytes, passphrase=None):
+        """Load the inner key state into the chip; save the outer state here.
+
+        With a passphrase, also save a locked copy of the inner state so the
+        key can be restored after the chip loses power."""
+        inner, outer = drive(key_states_gen(secret), self)
+        self._send_inner(inner)
         with open(OUTER_FILE, "w") as f:
             f.write(state_bytes(outer).hex())
+        if passphrase:
+            with open(BACKUP_FILE, "wb") as f:
+                f.write(seal_inner(state_bytes(inner), passphrase))
+
+    def restore(self, passphrase: str):
+        """Put the inner key state back after a power cycle."""
+        with open(BACKUP_FILE, "rb") as f:
+            inner = tuple(bytes_to_words(open_inner(f.read(), passphrase)))
+        self._send_inner(inner)
 
     def wipe(self):
         self.ser.write(b"Z")
         if self._expect(1) != b"Z":
             raise RuntimeError("the chip did not confirm the wipe")
-        if os.path.exists(OUTER_FILE):
-            os.remove(OUTER_FILE)
+        for path in (OUTER_FILE, BACKUP_FILE):
+            if os.path.exists(path):
+                os.remove(path)
 
     def code(self, t=None, step: int = 30, digits: int = 6) -> str:
         """A login code from the key the chip holds."""
@@ -323,6 +378,9 @@ def main():
     p.add_argument("--image", required=True, help="a photo of the sky from your own camera")
     p.add_argument("--name", default="skykey")
     p.add_argument("--issuer", default="SkyKey")
+    p.add_argument("--no-backup", action="store_true",
+                   help="don't save a passphrase-locked copy; the key is lost when the chip loses power")
+    sub.add_parser("restore", help="reload the key after the chip lost power (asks for your passphrase)")
     p = sub.add_parser("code")
     p.add_argument("--digits", type=int, default=6)
     sub.add_parser("wipe")
@@ -341,8 +399,13 @@ def main():
     if args.cmd == "enroll":
         with open(args.image, "rb") as f:
             image = f.read()
+        passphrase = None
+        if not args.no_backup:
+            passphrase = getpass.getpass("backup passphrase (needed to restore after unplugging): ")
+            if passphrase != getpass.getpass("again: "):
+                sys.exit("passphrases don't match")
         secret = make_secret(chip, image, os.urandom(16))
-        chip.load_key(secret)
+        chip.load_key(secret, passphrase)
         b32 = base64.b32encode(secret).decode().rstrip("=")
         label = urllib.parse.quote(f"{args.issuer}:{args.name}")
         print(f"sky photo: {len(image)} bytes from {args.image}")
@@ -350,6 +413,9 @@ def main():
         print(f"otpauth://totp/{label}?secret={b32}&issuer={urllib.parse.quote(args.issuer)}&algorithm=SHA1&digits=6&period=30")
         del secret, b32
         print("first code from the chip:", chip.code())
+    if args.cmd == "restore":
+        chip.restore(getpass.getpass("backup passphrase: "))
+        print("key restored; code:", chip.code())
     if args.cmd == "code":
         print(chip.code(digits=args.digits))
     if args.cmd == "wipe":
