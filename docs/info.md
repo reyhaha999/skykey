@@ -29,11 +29,11 @@ The 7-segment display shows H while hashing, P after a pass, F after a fail, and
 
 ## How to test
 
-Run `make -C test` (cocotb + Icarus) to check the chip against FIPS SHA-1, RFC 2202 HMAC and RFC 6238 TOTP vectors, with the key both on the computer and held on the chip, plus a wipe test and random blocks. On hardware, send `?` and expect `K`, then `T` and expect `P`. From a computer: `python host/skykey.py --port <port> selftest`, then `enroll --image sky.jpg`, then `code`.
+Run `make -C test` (cocotb + Icarus) to check the chip against FIPS SHA-1, RFC 2202 HMAC and RFC 6238 TOTP vectors, with the key both on the computer and held on the chip, plus a wipe test and random blocks. On hardware, send `?` and expect `K`, then `T` and expect `P`. From a computer: `python host/skykey.py --port <port> selftest`, then `enroll --image sky.jpg`, then `code`. After the board loses power, `restore` reloads the key from a passphrase-locked backup saved at enrollment.
 
 ## Honest limits
 
-This is a design demonstration, not a certified security key. The chip has no permanent memory, so the key is lost when power goes off (enroll again), and it has no clock of its own (the computer supplies the time). Like any TOTP token, the secret is shared once with the service at enrollment. The chip accepts message words from the computer as given, so it relies on the strength of SHA-1's rounds rather than checking them.
+This is a design demonstration, not a certified security key. The chip has no permanent memory, so the key is lost when power goes off; `restore` reloads it from the passphrase-locked backup made at enrollment (skip that backup with `--no-backup` and you enroll again instead), and it has no clock of its own (the computer supplies the time). Like any TOTP token, the secret is shared once with the service at enrollment. The chip accepts message words from the computer as given, so it relies on the strength of SHA-1's rounds rather than checking them.
 
 ## External hardware
 
